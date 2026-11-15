@@ -13,6 +13,9 @@ example/.lego
 example/cert
 ./vscode
 output/*
+/.cache/
+tools/core-upgrade/reports/*
+!tools/core-upgrade/reports/.gitkeep
 .idea/*
 newV2bX.sh
 quic_singbox.sh
