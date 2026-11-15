@@ -393,3 +393,131 @@ PowerShell 中用 Git Bash 显式调用：
 - 该内核的配置、用户生命周期、流量、限制和回滚测试通过；
 - 其他两个内核的协议和运行时回归没有退化；
 - release 产物记录了内核版本、fork commit、Go 版本、build flavor 和依赖锁。
+
+## 13. 内核升级自动化方案
+
+### 目标和边界
+
+自动化系统应完成以下工作：
+
+1. 读取目标内核版本和对应 fork 基线；
+2. 拉取官方上游源码或 Go module；
+3. 应用 V2bX 必需的兼容补丁/适配层；
+4. 在单内核和完整 release tags 下编译；
+5. 运行 API、配置生成、用户生命周期、流量、限制和协议回归；
+6. 输出兼容性报告、依赖锁和可发布 artifact。
+
+它不能保证任意上游版本都能被机械转换。尤其 sing-box 的动态用户能力涉及入站生命周期和连接语义，不能靠简单的函数名替换完成。自动化的正确目标是：
+
+```text
+上游版本 + 已审查兼容补丁 + V2bX adapter
+                    |
+                    v
+        编译/接口/行为/安全门禁
+                    |
+          通过 -> 生成 release candidate
+          失败 -> 输出冲突报告，不发布
+```
+
+### 推荐目录和输入
+
+后续实现可采用以下结构，不要求一次性完成：
+
+```text
+tools/core-upgrade/
+  versions.yaml              # 上游版本、fork commit、Go 版本、构建 tags
+  update.sh                  # 拉取、校验、应用补丁、编译、测试入口
+  update.ps1                 # Windows 开发机包装入口
+  patches/
+    sing-box/                # 动态用户等 V2bX 必需补丁
+    xray/                    # dispatcher/内部 API 适配补丁
+    hysteria/                # core/extras 接口适配补丁
+  probes/                    # 编译期 API 探针和版本断言
+  conformance/               # 配置、用户、流量、协议测试
+  reports/                   # 每次升级的机器可读和 Markdown 报告
+```
+
+`versions.yaml` 至少记录：上游仓库、目标 tag、当前 fork commit、补丁目录、Go 版本、build tags、预期协议和 release flavor。版本变更必须通过审查后才能进入生产 release。
+
+### 自动化流水线
+
+#### 1. 获取和完整性校验
+
+- 从锁文件读取版本，不使用浮动 branch 或未经记录的 pseudo-version；
+- 拉取后记录 commit、tag、模块校验和；
+- 对 fork 记录上游基线和 V2bX 补丁基线；
+- 确保补丁来源、变更说明和许可证可追溯。
+
+#### 2. 兼容补丁重放
+
+推荐使用 Git patch queue 或小型 fork，而不是对下载目录做字符串替换：
+
+- `git apply --check` 先检查补丁是否仍适用；
+- 补丁冲突立即失败并输出冲突文件；
+- 每个补丁保持单一目的，例如动态用户、统计 hook、dispatcher 适配；
+- 补丁重放成功后，自动输出上游 commit 与补丁 commit 的映射。
+
+对 sing-box，生产候选路线是“上游版本 + V2bX 动态用户补丁”的 fork。官方版本只能作为对照实验，除非已证明官方公共接口能够覆盖所有协议的用户增删和旧连接处理。
+
+#### 3. 编译期接口检查
+
+每个内核至少执行：
+
+- 单内核 build tag 编译；
+- 完整 release tags 编译；
+- `go test`、`go vet` 和必要的 race 测试；
+- 对使用的接口加入 compile-time assertion；
+- 检查依赖图、replace、Go 版本和未审查的间接升级。
+
+重点探针：
+
+- sing-box：动态用户入口、入站上下文、tracker/hook、流量读取；
+- Xray：inbound/outbound manager、dispatcher 注册、`DispatchLink`、stats/policy/routing 类型；
+- Hysteria：`RequestHook.UDP`、`Outbound.CheckUDP`、sniff 和 outbound extras。
+
+#### 4. 行为兼容测试
+
+编译通过只代表符号兼容，不能代表行为兼容。自动化测试至少包括：
+
+- 生成同一份 NodeInfo 后，新旧版本配置差异审查；
+- 用户添加、修改、删除、撤销、空列表、重复用户和重启恢复；
+- 删除用户后旧连接的断开语义；
+- 上下行流量、连接数、周期回报和 reset；
+- 速度、并发、IP、设备限制；
+- Xray 的 TCP/WS/gRPC/HTTP Upgrade/XHTTP、TLS/REALITY/fallback/sniff/route；
+- sing-box 的八类协议、UDP 和 hook；
+- Hysteria/TUIC 的 TCP、UDP、QUIC、丢包和长连接；
+- 面板 config/user/alivelist/push/alive 的错误、空响应和字段缺失场景。
+
+测试结果必须包含期望值和实际值，不能只记录进程退出码。
+
+#### 5. 兼容性报告和发布门禁
+
+报告至少包含：
+
+- 当前版本、目标版本、上游/fork commit；
+- 补丁重放结果和冲突文件；
+- Go/Docker 镜像 digest；
+- 编译、单元测试、race、协议和面板测试结果；
+- 依赖 diff 和安全公告检查；
+- 已知行为变化、未覆盖项和回滚 artifact。
+
+以下任一项失败，自动化流程只能生成失败报告，不能推送生产 release：补丁冲突、接口探针失败、完整 tags 构建失败、用户生命周期失败、流量/限制回归失败、面板协议失败或无法生成回滚 artifact。
+
+### 三个内核的自动化策略
+
+| 内核 | 自动化重点 | 可自动化程度 |
+| --- | --- | --- |
+| sing-box | fork 基线更新、动态用户补丁重放、八协议行为回归 | 中等；语义冲突需要人工处理 |
+| Xray | 版本锁定、dispatcher 编译探针、连接/统计/限制回归 | 较高；内部 API 变化仍需审查 |
+| Hysteria2 | core/extras 成套更新、接口探针、UDP/QUIC 回归 | 较高；必须同步两个 module |
+
+### 建议的触发方式
+
+- 手动触发：指定一个目标版本，生成一次兼容性报告；
+- 定时检查：只报告上游新版本，不自动进入生产；
+- Pull Request：补丁重放、单内核编译和完整组合编译；
+- release candidate：完整协议/面板回归和 artifact 签名；
+- production release：只允许已通过门禁的锁定版本。
+
+这样可以把“发现上游更新”和“允许生产发布”分成两个步骤，既能自动检查更新，也不会把未经验证的内核直接带入生产。

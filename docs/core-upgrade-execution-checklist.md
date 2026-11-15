@@ -127,3 +127,18 @@
 - [ ] 明确当前是“编译时可选”，不是运行时热插拔
 - [ ] release 产物记录 build flavor、三个内核版本和 fork commit
 - [ ] 若未来要实现运行时热插拔，另立 core-api/worker/IPC 项目
+
+## 12. 内核升级自动化
+
+- [ ] 建立版本锁文件，记录 tag、fork commit、Go 版本和 build flavor
+- [ ] 为 sing-box/Xray/Hysteria2 分别维护兼容补丁目录
+- [ ] 补丁应用前执行 `git apply --check`
+- [ ] 补丁冲突自动失败并生成报告
+- [ ] 每个内核单独 build tag 编译
+- [ ] 完整 release tags 编译
+- [ ] 执行编译期 API 探针
+- [ ] 执行用户增删改撤销和旧连接语义测试
+- [ ] 执行流量、限速、设备/IP 和 UDP/QUIC 测试
+- [ ] 执行面板 config/user/alivelist/push/alive 测试
+- [ ] 生成依赖 diff、版本、commit、镜像 digest 和 SHA-256 报告
+- [ ] 失败时禁止生成生产 release
