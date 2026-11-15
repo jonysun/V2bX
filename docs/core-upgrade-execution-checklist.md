@@ -125,4 +125,5 @@
 - [ ] 单内核构建通过后，完整 tags 组合仍通过
 - [ ] 记录共享间接依赖变化
 - [ ] 明确当前是“编译时可选”，不是运行时热插拔
-- [ ] 若要实现真正热插拔，另立 core-api/worker/IPC 项目
+- [ ] release 产物记录 build flavor、三个内核版本和 fork commit
+- [ ] 若未来要实现运行时热插拔，另立 core-api/worker/IPC 项目
