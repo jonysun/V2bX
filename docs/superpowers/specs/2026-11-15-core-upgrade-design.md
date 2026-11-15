@@ -32,7 +32,7 @@
 | Go | `1.25` / `go1.25.0` | `1.27` | 满足目标 Xray 的工具链要求 |
 | Xray | `v1.251202.0`，实际为 `wyx2685/xray-core` fork | `v26.11.9` | 先验证自定义 dispatcher，再决定 fork 基线 |
 | sing-box | `v1.13.0`，实际为 `wyx2685/sing-box_mod` fork | 官方 `v1.14.4` 作为对照；fork 作为生产候选 | 官方版本不能直接替代当前动态用户接口 |
-| Hysteria core/extras | `v2.6.4` | `v2.13.0` | core 和 extras 必须同版本成套升级 |
+| Hysteria core/extras | `v2.6.4` | `v2.14.0` | core 和 extras 必须同版本成套升级；`v2.13.0` 是之前的检查点 |
 
 ## 2. 当前架构
 
@@ -181,7 +181,7 @@ PowerShell 中用 Git Bash 显式调用：
 
 步骤：
 
-1. 将 `github.com/apernet/hysteria/core/v2` 与 `github.com/apernet/hysteria/extras/v2` 一起提升到目标版本。
+1. 将 `github.com/apernet/hysteria/core/v2` 与 `github.com/apernet/hysteria/extras/v2` 一起提升到目标版本 `v2.14.0`。
 2. 首先编译 `core/hy2`，处理 `RequestHook.UDP` 多包签名和 `Outbound.CheckUDP` 接口。
 3. 检查 `sniff.Sniffer`、`outbounds.PluggableOutboundAdapter` 等 extras 实现是否仍满足新接口。
 4. 对照旧配置生成结果，确认 TLS、QUIC、ACL、DNS、masquerade、HTTP/SOCKS outbound 没有默认值变化。
@@ -327,3 +327,59 @@ PowerShell 中用 Git Bash 显式调用：
 3. 建立依赖变更记录，先处理 Hysteria core/extras。
 4. 对 sing-box fork 和官方版本分别建立实验结果。
 5. 只在前一阶段通过后进入下一阶段；每次失败保留日志，不跨阶段混改。
+
+## 12. 内核单独升级和插拔能力
+
+### 当前已经具备的能力：编译时选择
+
+三个内核由独立的 build tag 文件引入：
+
+- `core/imports/xray.go`：`//go:build xray`；
+- `core/imports/sing.go`：`//go:build sing`；
+- `core/imports/hy2.go`：`//go:build hysteria2`。
+
+因此可以生成只包含某些内核的构建，例如只编译 Xray，或编译 Xray+sing。`core.Selector` 通过统一的 `Core` 接口和注册表选择内核。这适合减少某个产物的代码和依赖使用面，但不等于运行时插件。
+
+### 当前不能做到的事情：运行时热插拔
+
+- 三个内核仍在同一个 Go module 和 V2bX 进程内；
+- 改变任一内核版本都需要重新编译并重启该 V2bX 进程；
+- `go.mod` 仍包含全部直接依赖，单独 build tag 不会自动形成三个独立的依赖锁；
+- sing-box、Xray 的 fork 和间接依赖可能影响同一次构建中的其他内核；
+- 不能在不中断进程的情况下替换某一个内核实现。
+
+### 短期方案：分别升级、分别提交、统一集成
+
+在不重构架构的情况下，可以做到“分别升级”：
+
+1. 先固定 Go 工具链和基线。
+2. 单独升级 Hysteria core/extras，使用 `-tags hysteria2` 编译和测试。
+3. 单独升级 sing-box fork，使用 `-tags sing` 编译和测试。
+4. 单独升级 Xray fork，使用 `-tags xray` 编译和测试。
+5. 最后用完整 tags 组合编译，检查共享间接依赖和三内核并存行为。
+
+每个内核使用独立提交和升级记录；任何一个内核失败都可以只回滚该提交。生产发布仍然是一个包含已通过验证内核组合的 V2bX 版本。
+
+### 长期方案：真正独立的内核模块
+
+如果目标是让三个内核拥有独立版本、独立构建、独立发布甚至独立重启，需要把边界从 build tag 提升为进程/模块边界：
+
+1. 抽出稳定的 `core-api`：节点配置、用户增删、流量读取、在线状态、健康检查和版本信息。
+2. 为 Xray、sing-box、Hysteria2 分别建立 adapter module 和独立 CI；每个 adapter 只锁自己的上游内核版本。
+3. 选择一种运行模式：
+   - **同进程多产物：** 仍由主程序编译进 adapter，能独立构建但更新需要重启主程序；
+   - **外部进程：** 每个内核作为独立 worker，通过 gRPC/Unix socket/本地 HTTP 同步用户、流量和健康状态，才可以真正单独升级和重启。
+4. 主程序负责面板 API、节点调度、worker 生命周期、协议路由和版本兼容；worker 不直接依赖面板模型。
+5. 为每个 worker 建立独立镜像、SBOM、签名、回滚版本和兼容矩阵。
+
+外部进程方案会新增 IPC、进程监控、端口交接、流量一致性、失败重试和安全边界，不能作为本次内核升级的顺手重构；当前建议先采用短期方案，把接口和测试边界做稳，再评估是否拆进程。
+
+### 单独升级的验收规则
+
+一个内核升级只有同时满足以下条件，才算“可单独升级”：
+
+- 该内核在自己的 build tag 下可以独立编译和测试；
+- 完整 tags 组合仍可编译，且没有未审查的间接依赖漂移；
+- 该内核的配置、用户生命周期、流量、限制和回滚测试通过；
+- 其他两个内核的协议和运行时回归没有退化；
+- 产物记录了内核版本、fork commit、Go 版本和依赖锁。

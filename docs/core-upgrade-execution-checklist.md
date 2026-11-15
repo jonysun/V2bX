@@ -32,6 +32,7 @@
 
 ## 3. Hysteria2
 
+- [ ] 目标版本重新核对为 `core/extras v2.14.0`
 - [ ] core/extras 使用同一目标版本
 - [ ] 处理 `RequestHook.UDP` 签名
 - [ ] 处理 `Outbound.CheckUDP`
@@ -114,3 +115,14 @@
 - Hysteria/TUIC UDP 大面积丢包或连接异常；
 - 面板 API 错误被静默吞掉，导致节点状态与实际状态不一致；
 - 无法证明旧版本可恢复。
+
+## 11. 单独升级能力
+
+- [ ] 使用单独 build tag 编译 Hysteria2
+- [ ] 使用单独 build tag 编译 sing-box
+- [ ] 使用单独 build tag 编译 Xray
+- [ ] 每个内核有独立提交、日志和回滚点
+- [ ] 单内核构建通过后，完整 tags 组合仍通过
+- [ ] 记录共享间接依赖变化
+- [ ] 明确当前是“编译时可选”，不是运行时热插拔
+- [ ] 若要实现真正热插拔，另立 core-api/worker/IPC 项目
