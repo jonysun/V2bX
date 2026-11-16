@@ -4,7 +4,7 @@ WORKDIR /app
 COPY . .
 ENV CGO_ENABLED=0
 RUN GOEXPERIMENT=jsonv2 go mod download
-RUN GOEXPERIMENT=jsonv2 go build -v -o V2bX -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor"
+RUN GOEXPERIMENT=jsonv2 go build -v -o V2bX -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor" -ldflags "-checklinkname=0"
 
 # Release
 FROM  alpine
@@ -15,3 +15,4 @@ RUN mkdir /etc/V2bX/
 COPY --from=builder /app/V2bX /usr/local/bin
 
 ENTRYPOINT [ "V2bX", "server", "--config", "/etc/V2bX/config.json"]
+

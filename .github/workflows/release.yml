@@ -2,6 +2,11 @@ name: Build and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag to receive the build assets
+        required: false
+        type: string
   push:
     branches:
       - master
@@ -18,9 +23,6 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/release.yml"
-  release:
-    types: [published]
-
 permissions:
   contents: write
 
@@ -99,6 +101,7 @@ jobs:
       GOARCH: ${{ matrix.goarch }}
       GOARM: ${{ matrix.goarm }}
       CGO_ENABLED: 0
+      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - name: Checkout codebase
         uses: actions/checkout@v4
@@ -118,24 +121,28 @@ jobs:
         run: |
           go mod download
       - name: Get release version
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
         run: |
-          echo "version=$(echo $GITHUB_REF | cut -d / -f 3)" >> $GITHUB_ENV
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=$RELEASE_TAG" >> "$GITHUB_ENV"
       - name: Get other version
-        if: ${{ github.event_name != 'release' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.release_tag == '' }}
         run: |
           echo "version=${{ github.sha }}" >> $GITHUB_ENV
       - name: Build V2bX
         run: |
           echo "version: $version"
           mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 go build -v -o build_assets/V2bX -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor" -trimpath -ldflags "-X 'github.com/InazumaV/V2bX/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 go build -v -o build_assets/V2bX -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor" -trimpath -ldflags "-checklinkname=0 -X 'github.com/InazumaV/V2bX/cmd.version=$version' -s -w -buildid="
 
       - name: Build Mips softfloat V2bX
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
           echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/V2bX_softfloat -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor" -trimpath -ldflags "-X 'github.com/InazumaV/V2bX/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/V2bX_softfloat -tags "sing xray hysteria2 with_quic with_grpc with_utls with_wireguard with_acme with_gvisor" -trimpath -ldflags "-checklinkname=0 -X 'github.com/InazumaV/V2bX/cmd.version=$version' -s -w -buildid="
       - name: Rename Windows V2bX
         if: matrix.goos == 'windows'
         run: |
@@ -176,11 +183,31 @@ jobs:
           name: V2bX-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
             ./V2bX-${{ steps.get_filename.outputs.ASSET_NAME }}/*
-      - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release'
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./V2bX-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          tag: ${{ github.ref }}
-          file_glob: true
+      - name: Upload binaries to existing draft release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          release_json=$(gh release view "$RELEASE_TAG" --json isDraft,tagName) || {
+            echo "Release does not exist: $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$(jq -r '.tagName' <<<"$release_json")" == "$RELEASE_TAG" ]] || {
+            echo "Release tag mismatch for $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]] || {
+            echo "Release $RELEASE_TAG must be a draft before uploading assets" >&2
+            exit 1
+          }
+          assets=("./V2bX-${ASSET_NAME}.zip" "./V2bX-${ASSET_NAME}.zip.dgst")
+          for asset in "${assets[@]}"; do
+            [[ -s "$asset" ]] || { echo "Missing release asset: $asset" >&2; exit 1; }
+          done
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+
