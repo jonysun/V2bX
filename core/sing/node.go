@@ -8,12 +8,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"encoding/json"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/conf"
+	vCore "github.com/InazumaV/V2bX/core"
 	"github.com/sagernet/sing-box/option"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -51,6 +51,12 @@ type HttpupgradeNetworkConfig struct {
 }
 
 func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (option.Inbound, error) {
+	if err := vCore.ValidateNodeInfo(info); err != nil {
+		return option.Inbound{}, err
+	}
+	if c == nil || c.SingOptions == nil {
+		return option.Inbound{}, fmt.Errorf("SingOptions is required")
+	}
 	addr, err := netip.ParseAddr(c.ListenIP)
 	if err != nil {
 		return option.Inbound{}, fmt.Errorf("the listen ip not vail")
@@ -91,20 +97,22 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 		tls.Enabled = true
 		v := info.VAllss
 		tls.ServerName = v.TlsSettings.ServerName
-		port, _ := strconv.Atoi(v.TlsSettings.ServerPort)
-		var dest string
-		if v.TlsSettings.Dest != "" {
-			dest = v.TlsSettings.Dest
-		} else {
-			dest = tls.ServerName
+		dest, port, mtd, err := vCore.RealityHandshake(v)
+		if err != nil {
+			return option.Inbound{}, err
 		}
-
-		mtd, _ := time.ParseDuration(v.RealityConfig.MaxTimeDiff)
+		xver := v.TlsSettings.Xver
+		if xver == 0 {
+			xver = v.RealityConfig.Xver
+		}
+		if xver > 2 {
+			return option.Inbound{}, fmt.Errorf("Reality xver must be 0, 1 or 2")
+		}
 		tls.Reality = &option.InboundRealityOptions{
 			Enabled:    true,
 			ShortID:    []string{v.TlsSettings.ShortId},
 			PrivateKey: v.TlsSettings.PrivateKey,
-			Xver:       uint8(v.TlsSettings.Xver),
+			Xver:       uint8(xver),
 			Handshake: option.InboundRealityHandshakeOptions{
 				ServerOptions: option.ServerOptions{
 					Server:     dest,
@@ -120,6 +128,14 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 	switch info.Type {
 	case "vmess", "vless":
 		n := info.VAllss
+		switch n.Network {
+		case "", "tcp", "ws", "grpc", "httpupgrade":
+		default:
+			return option.Inbound{}, fmt.Errorf("unsupported sing transport %q", n.Network)
+		}
+		if n.Encryption != "" && n.Encryption != "none" {
+			return option.Inbound{}, fmt.Errorf("sing does not map VLESS encryption %q", n.Encryption)
+		}
 		t := option.V2RayTransportOptions{
 			Type: n.Network,
 		}
@@ -141,7 +157,9 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 							return option.Inbound{}, fmt.Errorf("decode HttpRequest error: %s", err)
 						}
 						t.HTTPOptions.Host = request.Headers.Host
-						t.HTTPOptions.Path = request.Path[0]
+						if len(request.Path) > 0 {
+							t.HTTPOptions.Path = request.Path[0]
+						}
 						t.HTTPOptions.Method = request.Method
 					}
 				} else {
@@ -168,7 +186,10 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 					return option.Inbound{}, fmt.Errorf("parse path error: %s", err)
 				}
 				path = u.Path
-				ed, _ = strconv.Atoi(u.Query().Get("ed"))
+				ed, err = parseEarlyData(u)
+				if err != nil {
+					return option.Inbound{}, err
+				}
 				headers = make(map[string]badoption.Listable[string], len(network.Headers))
 				for k, v := range network.Headers {
 					headers[k] = badoption.Listable[string]{
@@ -257,6 +278,11 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 		in.Options = ssoption
 	case "trojan":
 		n := info.Trojan
+		switch n.Network {
+		case "", "tcp", "ws", "grpc", "httpupgrade":
+		default:
+			return option.Inbound{}, fmt.Errorf("unsupported sing Trojan transport %q", n.Network)
+		}
 		t := option.V2RayTransportOptions{
 			Type: n.Network,
 		}
@@ -281,7 +307,10 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 					return option.Inbound{}, fmt.Errorf("parse path error: %s", err)
 				}
 				path = u.Path
-				ed, _ = strconv.Atoi(u.Query().Get("ed"))
+				ed, err = parseEarlyData(u)
+				if err != nil {
+					return option.Inbound{}, err
+				}
 				headers = make(map[string]badoption.Listable[string], len(network.Headers))
 				for k, v := range network.Headers {
 					headers[k] = badoption.Listable[string]{
@@ -306,6 +335,14 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 			t.GRPCOptions = option.V2RayGRPCOptions{
 				ServiceName: network.ServiceName,
 			}
+		case "httpupgrade":
+			var network HttpupgradeNetworkConfig
+			if len(n.NetworkSettings) > 0 {
+				if err := json.Unmarshal(n.NetworkSettings, &network); err != nil {
+					return option.Inbound{}, fmt.Errorf("decode HTTP Upgrade settings: %w", err)
+				}
+			}
+			t.HTTPUpgradeOptions = option.V2RayHTTPUpgradeOptions{Path: network.Path, Host: network.Host}
 		default:
 			t.Type = ""
 		}
@@ -394,8 +431,24 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 	return in, nil
 }
 
+func parseEarlyData(u *url.URL) (int, error) {
+	text := u.Query().Get("ed")
+	if text == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseUint(text, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid WebSocket early-data value %q: %w", text, err)
+	}
+	return int(value), nil
+}
+
 func (b *Sing) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) error {
-	b.nodeReportMinTrafficBytes[tag] = config.ReportMinTraffic * 1024
+	b.access.Lock()
+	defer b.access.Unlock()
+	if _, exists := b.nodeReportMinTrafficBytes[tag]; exists {
+		return fmt.Errorf("duplicate node %q", tag)
+	}
 	c, err := getInboundOptions(tag, info, config)
 	if err != nil {
 		return err
@@ -413,14 +466,28 @@ func (b *Sing) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) e
 	if err != nil {
 		return fmt.Errorf("add inbound error: %s", err)
 	}
+	b.nodeReportMinTrafficBytes[tag] = config.ReportMinTraffic * 1024
 	return nil
 }
 
 func (b *Sing) DelNode(tag string) error {
+	b.access.Lock()
+	defer b.access.Unlock()
 	in := b.box.Inbound()
-	err := in.Remove(tag)
-	if err != nil {
-		return fmt.Errorf("delete inbound error: %s", err)
+	if _, found := in.Get(tag); found {
+		if err := in.Remove(tag); err != nil {
+			return fmt.Errorf("delete inbound: %w", err)
+		}
 	}
+	b.users.mapLock.Lock()
+	defer b.users.mapLock.Unlock()
+	for user := range b.users.uidMap {
+		if strings.HasPrefix(user, tag+"|") {
+			b.hookServer.RevokeUser(tag, strings.TrimPrefix(user, tag+"|"))
+			delete(b.users.uidMap, user)
+		}
+	}
+	b.hookServer.counter.Delete(tag)
+	delete(b.nodeReportMinTrafficBytes, tag)
 	return nil
 }

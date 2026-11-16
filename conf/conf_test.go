@@ -11,6 +11,7 @@ func TestConf_LoadFromPath(t *testing.T) {
 
 func TestConf_Watch(t *testing.T) {
 	c := New()
-	t.Log(c.Watch("./1.json", "", "", func() {}))
-	select {}
+	if err := c.Watch(t.TempDir()+"/missing.json", "", "", func() {}); err == nil {
+		t.Fatal("Watch accepted a missing configuration file")
+	}
 }

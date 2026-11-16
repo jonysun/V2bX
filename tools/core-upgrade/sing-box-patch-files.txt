@@ -1,0 +1,27 @@
+# V2bX dynamic user hooks, inbound lifecycle, Reality xver, and focused tests.
+V2BX.md
+adapter/inbound.go
+adapter/inbound/manager.go
+adapter/inbound/manager_test.go
+adapter/lifecycle.go
+adapter/lifecycle_test.go
+adapter/router.go
+common/tls/reality_server.go
+option/tls.go
+protocol/anytls/anytls_user.go
+protocol/anytls/inbound.go
+protocol/hysteria/hysteria_user.go
+protocol/hysteria/inbound.go
+protocol/hysteria2/hysteria2_user.go
+protocol/hysteria2/inbound.go
+protocol/shadowsocks/shadowsocks_user.go
+protocol/trojan/inbound.go
+protocol/trojan/trojan_user.go
+protocol/tuic/inbound.go
+protocol/tuic/tuic_user.go
+protocol/v2bxusers
+protocol/vless/inbound.go
+protocol/vless/vless_user.go
+protocol/vmess/inbound.go
+protocol/vmess/vmess_user.go
+route/router.go

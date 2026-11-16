@@ -5,7 +5,6 @@ package dispatcher
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -196,10 +195,11 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		}
 		var lm *LinkManager
 		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
+			candidate := &LinkManager{
 				links: make(map[*ManagedWriter]buf.Reader),
 			}
-			d.LinkManagers.Store(user.Email, lm)
+			actual, _ := d.LinkManagers.LoadOrStore(user.Email, candidate)
+			lm = actual.(*LinkManager)
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
@@ -216,8 +216,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
+			actual, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+			t = actual.(*counter.TrafficCounter)
 		} else {
 			t = c.(*counter.TrafficCounter)
 		}
@@ -243,22 +243,8 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 	if domain == "" {
 		return false
 	}
-	for _, d := range request.ExcludeForDomain {
-		if strings.HasPrefix(d, "regexp:") {
-			pattern := d[7:]
-			re, err := regexp.Compile(pattern)
-			if err != nil {
-				errors.LogInfo(ctx, "Unable to compile regex")
-				continue
-			}
-			if re.MatchString(domain) {
-				return false
-			}
-		} else {
-			if strings.ToLower(domain) == d {
-				return false
-			}
-		}
+	if request.ExcludeForDomain != nil && request.ExcludeForDomain.MatchAny(strings.ToLower(domain)) {
+		return false
 	}
 	protocolString := result.Protocol()
 	if resComp, ok := result.(SnifferResultComposite); ok {
@@ -390,10 +376,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		}
 		var lm *LinkManager
 		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
+			candidate := &LinkManager{
 				links: make(map[*ManagedWriter]buf.Reader),
 			}
-			d.LinkManagers.Store(user.Email, lm)
+			actual, _ := d.LinkManagers.LoadOrStore(user.Email, candidate)
+			lm = actual.(*LinkManager)
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
@@ -408,8 +395,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
+			actual, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+			t = actual.(*counter.TrafficCounter)
 		} else {
 			t = c.(*counter.TrafficCounter)
 		}

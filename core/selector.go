@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -17,20 +18,31 @@ type Selector struct {
 
 func NewSelector(c []conf.CoreConfig) (Core, error) {
 	cs := make(map[string]Core, len(c))
+	cleanup := func() {
+		for _, existing := range cs {
+			_ = existing.Close()
+		}
+	}
 	for _, t := range c {
+		name := t.Name
+		if name == "" {
+			name = strings.ToLower(t.Type)
+		}
+		if _, exists := cs[name]; exists {
+			cleanup()
+			return nil, fmt.Errorf("duplicate core name %q", name)
+		}
 		f, ok := cores[strings.ToLower(t.Type)]
 		if !ok {
+			cleanup()
 			return nil, errors.New("unknown core type: " + t.Type)
 		}
 		core1, err := f(&t)
 		if err != nil {
+			cleanup()
 			return nil, err
 		}
-		if t.Name == "" {
-			cs[t.Type] = core1
-		} else {
-			cs[t.Name] = core1
-		}
+		cs[name] = core1
 	}
 	return &Selector{
 		cores: cs,
@@ -38,10 +50,22 @@ func NewSelector(c []conf.CoreConfig) (Core, error) {
 }
 
 func (s *Selector) Start() error {
-	for i := range s.cores {
-		err := s.cores[i].Start()
-		if err != nil {
-			return err
+	names := make([]string, 0, len(s.cores))
+	for name := range s.cores {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := s.cores[name].Start(); err != nil {
+			var errs []error
+			errs = append(errs, fmt.Errorf("start core %q: %w", name, err))
+			for i := len(names) - 1; i >= 0; i-- {
+				nameToClose := names[i]
+				if closeErr := s.cores[nameToClose].Close(); closeErr != nil {
+					errs = append(errs, fmt.Errorf("close core %q after startup failure: %w", nameToClose, closeErr))
+				}
+			}
+			return errors.Join(errs...)
 		}
 	}
 	return nil
@@ -67,11 +91,17 @@ func isSupported(protocol string, protocols []string) bool {
 }
 
 func (s *Selector) AddNode(tag string, info *panel.NodeInfo, option *conf.Options) error {
+	if _, exists := s.nodes.Load(tag); exists {
+		return fmt.Errorf("duplicate node tag %q", tag)
+	}
 	var core Core
 	if len(option.CoreName) > 0 {
 		// use name to select core
 		if c, ok := s.cores[option.CoreName]; ok {
 			core = c
+			if core != nil && !isSupported(info.Type, core.Protocols()) {
+				return fmt.Errorf("core %q does not support %q", option.CoreName, info.Type)
+			}
 		}
 	} else {
 		// use type to select core
@@ -82,6 +112,12 @@ func (s *Selector) AddNode(tag string, info *panel.NodeInfo, option *conf.Option
 				}
 			} else if option.Core != c.Type() {
 				continue
+			}
+			if !isSupported(info.Type, c.Protocols()) {
+				continue
+			}
+			if core != nil {
+				return fmt.Errorf("multiple cores support %q; set CoreName explicitly", info.Type)
 			}
 			core = c
 		}
@@ -114,7 +150,7 @@ func (s *Selector) DelNode(tag string) error {
 		s.nodes.Delete(tag)
 		return nil
 	}
-	return errors.New("the node is not have")
+	return nil
 }
 
 func (s *Selector) AddUsers(p *AddUsersParams) (added int, err error) {
@@ -131,6 +167,17 @@ func (s *Selector) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraf
 		return nil, errors.New("the node is not have")
 	}
 	return t.(Core).GetUserTrafficSlice(tag, reset)
+}
+
+func (s *Selector) DrainTraffic(tag string) ([]panel.UserTraffic, error) {
+	t, exists := s.nodes.Load(tag)
+	if !exists {
+		return nil, nil
+	}
+	if d, ok := t.(TrafficDrainer); ok {
+		return d.DrainTraffic(tag)
+	}
+	return t.(Core).GetUserTrafficSlice(tag, true)
 }
 
 func (s *Selector) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {

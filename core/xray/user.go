@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/common/counter"
@@ -11,6 +12,7 @@ import (
 	"github.com/InazumaV/V2bX/core/xray/app/dispatcher"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/proxy/shadowsocks"
 )
 
 func (c *Xray) GetUserManager(tag string) (proxy.UserManager, error) {
@@ -30,6 +32,8 @@ func (c *Xray) GetUserManager(tag string) (proxy.UserManager, error) {
 }
 
 func (c *Xray) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+	c.access.Lock()
+	defer c.access.Unlock()
 	userManager, err := c.GetUserManager(tag)
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
@@ -39,9 +43,10 @@ func (c *Xray) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) e
 	defer c.users.mapLock.Unlock()
 	for i := range users {
 		user = format.UserTag(tag, users[i].Uuid)
-		err = userManager.RemoveUser(context.Background(), user)
-		if err != nil {
-			return err
+		if userManager.GetUser(context.Background(), user) != nil {
+			if err = userManager.RemoveUser(context.Background(), user); err != nil {
+				return err
+			}
 		}
 		delete(c.users.uidMap, user)
 		if v, ok := c.dispatcher.Counter.Load(tag); ok {
@@ -58,6 +63,16 @@ func (c *Xray) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) e
 }
 
 func (x *Xray) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic, error) {
+	return x.getTraffic(tag, reset, false)
+}
+
+func (x *Xray) DrainTraffic(tag string) ([]panel.UserTraffic, error) {
+	return x.getTraffic(tag, true, true)
+}
+
+func (x *Xray) getTraffic(tag string, reset, force bool) ([]panel.UserTraffic, error) {
+	x.access.Lock()
+	defer x.access.Unlock()
 	trafficSlice := make([]panel.UserTraffic, 0)
 	x.users.mapLock.RLock()
 	defer x.users.mapLock.RUnlock()
@@ -68,17 +83,15 @@ func (x *Xray) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic,
 			traffic := value.(*counter.TrafficStorage)
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
-			if up+down > x.nodeReportMinTrafficBytes[tag] {
-				if reset {
-					traffic.UpCounter.Store(0)
-					traffic.DownCounter.Store(0)
-				}
+			if up+down > x.nodeReportMinTrafficBytes[tag] || force {
+				up, down = traffic.Snapshot(reset)
 				if x.users.uidMap[email] == 0 {
 					c.Delete(email)
 					return true
 				}
 				trafficSlice = append(trafficSlice, panel.UserTraffic{
 					UID:      x.users.uidMap[email],
+					Uuid:     strings.TrimPrefix(email, tag+"|"),
 					Upload:   up,
 					Download: down,
 				})
@@ -94,10 +107,23 @@ func (x *Xray) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic,
 }
 
 func (c *Xray) AddUsers(p *vCore.AddUsersParams) (added int, err error) {
+	c.access.Lock()
+	defer c.access.Unlock()
 	c.users.mapLock.Lock()
 	defer c.users.mapLock.Unlock()
-	for i := range p.Users {
-		c.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
+	if p.NodeInfo.Type == "shadowsocks" && p.Shadowsocks.ServerKey == "" && getCipherFromString(p.Shadowsocks.Cipher) == shadowsocks.CipherType_UNKNOWN {
+		return 0, fmt.Errorf("unsupported Shadowsocks cipher %q", p.Shadowsocks.Cipher)
+	}
+	if p.NodeInfo.Type == "shadowsocks" && p.Shadowsocks.ServerKey != "" {
+		length := 32
+		if p.Shadowsocks.Cipher == "2022-blake3-aes-128-gcm" {
+			length = 16
+		}
+		for _, u := range p.Users {
+			if len(u.Uuid) < length {
+				return 0, fmt.Errorf("Shadowsocks 2022 user %d credential requires at least %d bytes", u.Id, length)
+			}
+		}
 	}
 	var users []*protocol.User
 	switch p.NodeInfo.Type {
@@ -108,10 +134,15 @@ func (c *Xray) AddUsers(p *vCore.AddUsersParams) (added int, err error) {
 	case "trojan":
 		users = buildTrojanUsers(p.Tag, p.Users)
 	case "shadowsocks":
+		ivCheck := true
+		if value, ok := c.ivCheck.Load(p.Tag); ok {
+			ivCheck = value.(bool)
+		}
 		users = buildSSUsers(p.Tag,
 			p.Users,
 			p.Shadowsocks.Cipher,
-			p.Shadowsocks.ServerKey)
+			p.Shadowsocks.ServerKey,
+			ivCheck)
 	default:
 		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
 	}
@@ -119,15 +150,30 @@ func (c *Xray) AddUsers(p *vCore.AddUsersParams) (added int, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
+	memory := make([]*protocol.MemoryUser, 0, len(users))
 	for _, u := range users {
 		mUser, err := u.ToMemoryUser()
 		if err != nil {
 			return 0, err
 		}
-		err = man.AddUser(context.Background(), mUser)
+		memory = append(memory, mUser)
+	}
+	var inserted []string
+	for _, u := range memory {
+		if existing := man.GetUser(context.Background(), u.Email); existing != nil {
+			continue
+		}
+		err = man.AddUser(context.Background(), u)
 		if err != nil {
+			for _, email := range inserted {
+				_ = man.RemoveUser(context.Background(), email)
+			}
 			return 0, err
 		}
+		inserted = append(inserted, u.Email)
+	}
+	for _, u := range p.Users {
+		c.users.uidMap[format.UserTag(p.Tag, u.Uuid)] = u.Id
 	}
 	return len(users), nil
 }

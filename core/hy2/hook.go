@@ -35,18 +35,17 @@ func (h *HookServer) LogTraffic(id string, tx, rx uint64) (ok bool) {
 		return false
 	}
 
-	userLimit, ok := limiterinfo.UserLimitInfo.Load(format.UserTag(h.Tag, id))
-	if ok {
-		userlimitInfo := userLimit.(*limiter.UserLimitInfo)
-		if userlimitInfo.OverLimit {
-			userlimitInfo.OverLimit = false
-			return false
-		}
+	bucket, rejected := limiterinfo.CheckLimit(format.UserTag(h.Tag, id), "", false, false)
+	if rejected {
+		return false
+	}
+	if bucket != nil {
+		bucket.Wait(int64(tx))
+		bucket.Wait(int64(rx))
 	}
 
 	if c, exists = h.Counter.Load(h.Tag); !exists {
-		c = counter.NewTrafficCounter()
-		h.Counter.Store(h.Tag, c)
+		c, _ = h.Counter.LoadOrStore(h.Tag, counter.NewTrafficCounter())
 	}
 
 	if tc, ok := c.(*counter.TrafficCounter); ok {

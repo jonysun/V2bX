@@ -11,6 +11,7 @@ MODE="pre-update"
 CORE="all"
 SKIP_BUILD=0
 ALLOW_DIRTY=0
+VERIFY_UPSTREAM=0
 REPORT=""
 FAILURES=0
 WARNINGS=0
@@ -24,6 +25,7 @@ Options:
   --core all|xray|sing|hysteria2  build one core or the full release combination
   --skip-build                    skip Docker checks and compilation
   --allow-dirty                   allow unrelated working-tree changes
+  --verify-upstream                verify pinned release refs with git ls-remote
   --report PATH                   write the Markdown report to PATH
   -h, --help                      show this help
 EOF
@@ -125,6 +127,85 @@ check_dependencies() {
       record WARN "no fork replace is recorded for ${module}; official API compatibility must be proven"
     fi
   done
+  if grep -q '^replace github.com/quic-go/qpack => ./third_party/qpack-compat$' "$ROOT/go.mod" && check_file "third_party/qpack-compat/decoder.go"; then
+    record OK "qpack compatibility bridge is present"
+  else
+    record WARN "qpack compatibility bridge is not configured"
+  fi
+  return "$failed"
+}
+
+check_version_pin() {
+  local module version
+  module="$1"
+  version="$2"
+  if [[ -z "$version" ]] || ! grep -Fq "${module} ${version}" "$ROOT/go.mod"; then
+    record ERROR "go.mod does not pin ${module} to ${version}"
+    return 1
+  fi
+  record OK "go.mod pins ${module} to ${version}"
+}
+
+check_source_provenance() {
+  local failed=0
+  local marker expected label
+  for item in "third_party/xray-core/V2BX.md:$(manifest_value TARGET_XRAY_COMMIT):Xray" \
+              "third_party/sing-box/V2BX.md:$(manifest_value TARGET_SING_COMMIT):sing-box"; do
+    marker="${item%%:*}"
+    expected="${item#*:}"
+    label="${expected##*:}"
+    expected="${expected%:*}"
+    if check_file "$marker" && grep -Fq "$expected" "$ROOT/$marker"; then
+      record OK "${label} source marker records commit ${expected}"
+    else
+      record ERROR "${label} source marker does not match pinned commit ${expected}"
+      failed=1
+    fi
+  done
+
+  check_version_pin github.com/apernet/hysteria/core/v2 "$(manifest_value TARGET_HYSTERIA)" || failed=1
+  check_version_pin github.com/apernet/hysteria/extras/v2 "$(manifest_value TARGET_HYSTERIA)" || failed=1
+  check_version_pin github.com/sagernet/sing-box "$(manifest_value TARGET_SING)" || failed=1
+  check_version_pin github.com/xtls/xray-core "$(manifest_value TARGET_XRAY_MODULE_VERSION)" || failed=1
+  return "$failed"
+}
+
+verify_upstream_ref() {
+  local label repo ref expected actual output status detail
+  label="$1"
+  repo="$2"
+  ref="$3"
+  expected="$4"
+  if output="$(timeout 30s git ls-remote "$repo" "$ref" "${ref}^{}" 2>&1)"; then
+    actual="$(printf '%s\n' "$output" | awk -v ref="$ref" '$2 == ref "^{}" { print $1; exit }')"
+    if [[ -z "$actual" ]]; then
+      actual="$(printf '%s\n' "$output" | awk -v ref="$ref" '$2 == ref { print $1; exit }')"
+    fi
+  else
+    status=$?
+    detail="${output:-no diagnostic}"
+    if [[ "$status" -eq 124 ]]; then
+      detail="timed out after 30 seconds${output:+: $output}"
+    fi
+    record ERROR "unable to query upstream ${label} ${ref} (git ls-remote exit ${status}): ${detail}"
+    return 1
+  fi
+  if [[ "$actual" == "$expected" ]]; then
+    record OK "upstream ${label} ${ref} resolves to ${expected}"
+  elif [[ -z "$actual" ]]; then
+    record ERROR "upstream ${label} has no ref ${ref}"
+    return 1
+  else
+    record ERROR "upstream ${label} ${ref} resolves to ${actual}, expected ${expected}"
+    return 1
+  fi
+}
+
+check_upstream_refs() {
+  local failed=0
+  verify_upstream_ref Xray "$(manifest_value TARGET_XRAY_REPO)" "$(manifest_value TARGET_XRAY_REF)" "$(manifest_value TARGET_XRAY_COMMIT)" || failed=1
+  verify_upstream_ref sing-box "$(manifest_value TARGET_SING_REPO)" "$(manifest_value TARGET_SING_REF)" "$(manifest_value TARGET_SING_COMMIT)" || failed=1
+  verify_upstream_ref Hysteria "$(manifest_value TARGET_HYSTERIA_REPO)" "$(manifest_value TARGET_HYSTERIA_REF)" "$(manifest_value TARGET_HYSTERIA_COMMIT)" || failed=1
   return "$failed"
 }
 
@@ -185,27 +266,128 @@ build_tags_for_core() {
   esac
 }
 
+test_packages_for_core() {
+  case "$1" in
+    all) printf '%s' './...' ;;
+    xray) printf '%s' '. ./cmd ./api/panel ./conf ./common/... ./core ./core/imports ./core/xray/... ./limiter ./node' ;;
+    sing) printf '%s' '. ./cmd ./api/panel ./conf ./common/... ./core ./core/imports ./core/sing/... ./limiter ./node' ;;
+    hysteria2) printf '%s' '. ./cmd ./api/panel ./conf ./common/... ./core ./core/imports ./core/hy2/... ./limiter ./node' ;;
+    *) return 1 ;;
+  esac
+}
+
+behavior_test_packages_for_core() {
+  case "$1" in
+    all) printf '%s' '. ./api/panel ./common/... ./core ./core/imports ./core/xray/... ./core/sing/... ./core/hy2/... ./limiter ./node' ;;
+    xray) printf '%s' '. ./api/panel ./common/... ./core ./core/imports ./core/xray/... ./limiter ./node' ;;
+    sing) printf '%s' '. ./api/panel ./common/... ./core ./core/imports ./core/sing/... ./limiter ./node' ;;
+    hysteria2) printf '%s' '. ./api/panel ./common/... ./core ./core/imports ./core/hy2/... ./limiter ./node' ;;
+    *) return 1 ;;
+  esac
+}
+
 run_docker_build() {
   local tags="$1"
-  docker_go go version
-  docker_go go mod verify
-  docker_go go test ./... -tags "$tags"
-  docker_go env GOEXPERIMENT=jsonv2 go build -trimpath -o /tmp/V2bX -tags "$tags"
+  local packages_string="$2"
+  local packages=()
+  read -r -a packages <<< "$packages_string"
+  docker_go go version || return $?
+  # Compile every package without running external or networked tests. The
+  # full behavior suite runs as a separate release gate after this probe.
+  docker_go go test "${packages[@]}" -run '^$' -tags "$tags" || return $?
+  docker_go env GOEXPERIMENT=jsonv2 go build -trimpath -o /tmp/V2bX -tags "$tags" || return $?
+}
+
+run_docker_behavior_tests() {
+  local tags="$1"
+  local packages_string="$2"
+  local packages=()
+  read -r -a packages <<< "$packages_string"
+  docker_go go test "${packages[@]}" -count=1 -tags "$tags" || return $?
+  # TestConf_Watch intentionally blocks forever; run only the bounded config-load test.
+  docker_go go test ./conf -run '^TestConf_LoadFromPath$' -count=1 -tags "$tags"
+}
+
+run_xray_fork_tests() {
+  local quic_version
+  quic_version="$(manifest_value TARGET_QUIC)"
+  docker_go sh -c "cd /src/third_party/xray-core && cp go.mod /tmp/xray-test.mod && cp go.sum /tmp/xray-test.sum && go mod edit -modfile=/tmp/xray-test.mod -require=${quic_version} && go mod edit -modfile=/tmp/xray-test.mod -replace=github.com/quic-go/qpack=/src/third_party/qpack-compat && go test -mod=mod -modfile=/tmp/xray-test.mod ./proxy/shadowsocks && go test -mod=mod -modfile=/tmp/xray-test.mod ./infra/conf -run 'TestShadowsocksServerConfigParsing|TestShadowsocksIVCheckConfigCompatibility'"
+}
+
+run_sing_box_fork_tests() {
+  local quic_version
+  quic_version="$(manifest_value TARGET_QUIC)"
+  docker_go sh -c "cd /src/third_party/sing-box && cp go.mod /tmp/sing-test.mod && cp go.sum /tmp/sing-test.sum && go mod edit -modfile=/tmp/sing-test.mod -require=${quic_version} && go mod edit -modfile=/tmp/sing-test.mod -replace=github.com/quic-go/qpack=/src/third_party/qpack-compat && go test -mod=mod -modfile=/tmp/sing-test.mod ./adapter ./adapter/inbound ./protocol/v2bxusers"
+}
+
+run_source_snapshot_check() {
+  local failed=0
+  if [[ "$CORE" == "xray" || "$CORE" == "all" ]]; then
+    docker_go bash tools/core-upgrade/check-source-snapshot.sh \
+      github.com/xtls/xray-core \
+      "$(manifest_value TARGET_XRAY_MODULE_VERSION)" \
+      "$(manifest_value TARGET_XRAY_COMMIT)" \
+      third_party/xray-core tools/core-upgrade/xray-patch-files.txt || failed=1
+  fi
+  if [[ "$CORE" == "sing" || "$CORE" == "all" ]]; then
+    docker_go bash tools/core-upgrade/check-source-snapshot.sh \
+      github.com/sagernet/sing-box \
+      "$(manifest_value TARGET_SING)" \
+      "$(manifest_value TARGET_SING_COMMIT)" \
+      third_party/sing-box tools/core-upgrade/sing-box-patch-files.txt || failed=1
+  fi
+  return "$failed"
 }
 
 run_build_check() {
   local tags="$1"
+  local packages_string="$2"
+  local behavior_packages
   if ! docker_available; then
     record ERROR "Docker daemon is unavailable; use --skip-build for static checks only"
     return 1
   fi
   record OK "Docker daemon is available"
-  if run_docker_build "$tags" >"$TMPDIR/v2bx-core-check.out" 2>&1; then
-    record OK "Docker compile/test (${CORE})"
-    return 0
+  if [[ "$CORE" != "hysteria2" ]]; then
+    if run_source_snapshot_check >"$RUN_TMPDIR/v2bx-core-sources.out" 2>&1; then
+      record OK "upstream source snapshots match their V2bX patch allowlists (${CORE})"
+    else
+      record ERROR "upstream source snapshot check (${CORE}) failed\n$(sed -n '1,100p' "$RUN_TMPDIR/v2bx-core-sources.out")"
+      return 1
+    fi
   fi
-  record ERROR "Docker compile/test (${CORE}) failed\n$(sed -n '1,100p' "$TMPDIR/v2bx-core-check.out")"
-  return 1
+  if run_docker_build "$tags" "$packages_string" >"$RUN_TMPDIR/v2bx-core-check.out" 2>&1; then
+    record OK "Docker compile/test (${CORE})"
+  else
+    record ERROR "Docker compile/test (${CORE}) failed\n$(sed -n '1,100p' "$RUN_TMPDIR/v2bx-core-check.out")"
+    return 1
+  fi
+
+  behavior_packages="$(behavior_test_packages_for_core "$CORE")"
+  if run_docker_behavior_tests "$tags" "$behavior_packages" >"$RUN_TMPDIR/v2bx-core-tests.out" 2>&1; then
+    record OK "Docker behavior tests (${CORE})"
+  else
+    record ERROR "Docker behavior tests (${CORE}) failed\n$(sed -n '1,100p' "$RUN_TMPDIR/v2bx-core-tests.out")"
+    return 1
+  fi
+
+  if [[ "$CORE" == "xray" || "$CORE" == "all" ]]; then
+    if run_xray_fork_tests >"$RUN_TMPDIR/v2bx-xray-fork-tests.out" 2>&1; then
+      record OK "Xray fork compatibility tests"
+    else
+      record ERROR "Xray fork compatibility tests failed\n$(sed -n '1,100p' "$RUN_TMPDIR/v2bx-xray-fork-tests.out")"
+      return 1
+    fi
+  fi
+  if [[ "$CORE" == "sing" || "$CORE" == "all" ]]; then
+    if run_sing_box_fork_tests >"$RUN_TMPDIR/v2bx-sing-box-fork-tests.out" 2>&1; then
+      record OK "sing-box fork compatibility tests"
+    else
+      record ERROR "sing-box fork compatibility tests failed\n$(sed -n '1,100p' "$RUN_TMPDIR/v2bx-sing-box-fork-tests.out")"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 while [[ $# -gt 0 ]]; do
@@ -214,6 +396,7 @@ while [[ $# -gt 0 ]]; do
     --core) CORE="${2:-}"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
+    --verify-upstream) VERIFY_UPSTREAM=1; shift ;;
     --report) REPORT="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -230,32 +413,41 @@ if [[ "$CORE" != "all" && "$CORE" != "xray" && "$CORE" != "sing" && "$CORE" != "
 fi
 
 if [[ -z "$REPORT" ]]; then
-  REPORT="$ROOT/tools/core-upgrade/reports/core-compat-$(date -u +%Y%m%dT%H%M%SZ).md"
+	REPORT="$ROOT/tools/core-upgrade/reports/core-compat-${CORE}-${MODE}-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
 fi
 mkdir -p "$(dirname "$REPORT")"
+RUN_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/v2bx-core-check.XXXXXX")"
+trap 'rm -rf "$RUN_TMPDIR"' EXIT
 {
   printf '%s\n\n' '# V2bX Core Compatibility Report'
   printf '%s\n' "- Mode: \`${MODE}\`"
   printf '%s\n' "- Core: \`${CORE}\`"
   printf '%s\n' "- Target Xray: \`$(manifest_value TARGET_XRAY)\`"
+  printf '%s\n' "- Xray commit: \`$(manifest_value TARGET_XRAY_COMMIT)\`"
   printf '%s\n' "- Target sing-box: \`$(manifest_value TARGET_SING)\`"
+  printf '%s\n' "- sing-box commit: \`$(manifest_value TARGET_SING_COMMIT)\`"
   printf '%s\n' "- Target Hysteria: \`$(manifest_value TARGET_HYSTERIA)\`"
+  printf '%s\n' "- Hysteria commit: \`$(manifest_value TARGET_HYSTERIA_COMMIT)\`"
   printf '%s\n\n' "- Started: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
   printf '%s\n' '## Checks'
 } > "$REPORT"
 
-TMPDIR="${TMPDIR:-/tmp}"
 check_git_state || true
 check_source_layout || true
 check_build_tags || true
 check_dependencies || true
+check_source_provenance || true
 check_go_versions || true
+if [[ "$VERIFY_UPSTREAM" -eq 1 ]]; then
+  check_upstream_refs || true
+fi
 
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   record WARN "Docker build was skipped by --skip-build"
 else
   tags="$(build_tags_for_core "$CORE")"
-  run_build_check "$tags" || true
+  packages_string="$(test_packages_for_core "$CORE")"
+  run_build_check "$tags" "$packages_string" || true
 fi
 
 {

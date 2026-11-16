@@ -2,11 +2,11 @@ package rate
 
 import (
 	"net"
-
-	"github.com/juju/ratelimit"
 )
 
-func NewConnRateLimiter(c net.Conn, l *ratelimit.Bucket) *Conn {
+type Waiter interface{ Wait(int64) }
+
+func NewConnRateLimiter(c net.Conn, l Waiter) *Conn {
 	return &Conn{
 		Conn:    c,
 		limiter: l,
@@ -15,7 +15,7 @@ func NewConnRateLimiter(c net.Conn, l *ratelimit.Bucket) *Conn {
 
 type Conn struct {
 	net.Conn
-	limiter *ratelimit.Bucket
+	limiter Waiter
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {

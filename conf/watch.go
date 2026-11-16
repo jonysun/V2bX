@@ -10,17 +10,25 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-func (p *Conf) Watch(filePath, xDnsPath string, sDnsPath string, reload func()) error {
+func (p *Conf) Watch(filePath, xDnsPath string, sDnsPath string, reload func()) (err error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("new watcher error: %s", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = watcher.Close()
+		}
+	}()
 	go func() {
 		var pre time.Time
 		defer watcher.Close()
 		for {
 			select {
-			case e := <-watcher.Events:
+			case e, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
 				if e.Has(fsnotify.Chmod) {
 					continue
 				}
@@ -44,7 +52,10 @@ func (p *Conf) Watch(filePath, xDnsPath string, sDnsPath string, reload func()) 
 					reload()
 					log.Println("reload config success")
 				}()
-			case err := <-watcher.Errors:
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
 				if err != nil {
 					log.Printf("File watcher error: %s", err)
 				}

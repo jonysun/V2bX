@@ -12,19 +12,20 @@ import (
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 )
 
-func buildSSUsers(tag string, userInfo []panel.UserInfo, cypher string, serverKey string) (users []*protocol.User) {
+func buildSSUsers(tag string, userInfo []panel.UserInfo, cypher string, serverKey string, ivCheck bool) (users []*protocol.User) {
 	users = make([]*protocol.User, len(userInfo))
 	for i := range userInfo {
-		users[i] = buildSSUser(tag, &userInfo[i], cypher, serverKey)
+		users[i] = buildSSUser(tag, &userInfo[i], cypher, serverKey, ivCheck)
 	}
 	return users
 }
 
-func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey string) (user *protocol.User) {
+func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey string, ivCheck bool) (user *protocol.User) {
 	if serverKey == "" {
 		ssAccount := &shadowsocks.Account{
 			Password:   userInfo.Uuid,
 			CipherType: getCipherFromString(cypher),
+			IvCheck:    ivCheck,
 		}
 		return &protocol.User{
 			Level:   0,
@@ -42,7 +43,7 @@ func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey 
 			keyLength = 32
 		}
 		ssAccount := &shadowsocks_2022.Account{
-			Key:   base64.StdEncoding.EncodeToString([]byte(userInfo.Uuid[:keyLength])),
+			Key: base64.StdEncoding.EncodeToString([]byte(userInfo.Uuid[:keyLength])),
 		}
 		return &protocol.User{
 			Level:   0,
@@ -60,8 +61,8 @@ func getCipherFromString(c string) shadowsocks.CipherType {
 		return shadowsocks.CipherType_AES_256_GCM
 	case "chacha20-poly1305", "aead_chacha20_poly1305", "chacha20-ietf-poly1305":
 		return shadowsocks.CipherType_CHACHA20_POLY1305
-	case "none", "plain":
-		return shadowsocks.CipherType_NONE
+	case "xchacha20-poly1305", "aead_xchacha20_poly1305", "xchacha20-ietf-poly1305":
+		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	default:
 		return shadowsocks.CipherType_UNKNOWN
 	}

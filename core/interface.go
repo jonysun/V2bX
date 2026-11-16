@@ -22,3 +22,9 @@ type Core interface {
 	Protocols() []string
 	Type() string
 }
+
+// TrafficDrainer collects even bytes below the reporting threshold before a
+// destructive user/node operation. Controllers retain the result for retry.
+type TrafficDrainer interface {
+	DrainTraffic(tag string) ([]panel.UserTraffic, error)
+}
