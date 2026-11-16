@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/InazumaV/V2bX/conf"
 )
@@ -19,7 +20,7 @@ func NewCore(c []conf.CoreConfig) (Core, error) {
 		return NewSelector(c)
 	}
 	// one core
-	if f, ok := cores[c[0].Type]; ok {
+	if f, ok := cores[strings.ToLower(c[0].Type)]; ok {
 		return f(&c[0])
 	} else {
 		return nil, errors.New("unknown core type")
@@ -27,7 +28,7 @@ func NewCore(c []conf.CoreConfig) (Core, error) {
 }
 
 func RegisterCore(t string, f func(c *conf.CoreConfig) (Core, error)) {
-	cores[t] = f
+	cores[strings.ToLower(t)] = f
 }
 
 func RegisteredCore() []string {

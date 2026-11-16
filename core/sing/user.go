@@ -3,9 +3,11 @@ package sing
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/common/counter"
+	"github.com/InazumaV/V2bX/common/format"
 	"github.com/InazumaV/V2bX/core"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/anytls"
@@ -19,15 +21,14 @@ import (
 )
 
 func (b *Sing) AddUsers(p *core.AddUsersParams) (added int, err error) {
+	b.access.Lock()
+	defer b.access.Unlock()
 	in, found := b.box.Inbound().Get(p.Tag)
 	if !found {
 		return 0, errors.New("the inbound not found")
 	}
 	b.users.mapLock.Lock()
 	defer b.users.mapLock.Unlock()
-	for i := range p.Users {
-		b.users.uidMap[p.Users[i].Uuid] = p.Users[i].Id
-	}
 	switch p.NodeInfo.Type {
 	case "vless":
 		us := make([]option.VLESSUser, len(p.Users))
@@ -54,8 +55,14 @@ func (b *Sing) AddUsers(p *core.AddUsersParams) (added int, err error) {
 			var password = p.Users[i].Uuid
 			switch p.Shadowsocks.Cipher {
 			case "2022-blake3-aes-128-gcm":
+				if len(password) < 16 {
+					return 0, fmt.Errorf("Shadowsocks 2022 user %d credential requires 16 bytes", p.Users[i].Id)
+				}
 				password = base64.StdEncoding.EncodeToString([]byte(password[:16]))
-			case "2022-blake3-aes-256-gcm":
+			case "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+				if len(password) < 32 {
+					return 0, fmt.Errorf("Shadowsocks 2022 user %d credential requires 32 bytes", p.Users[i].Id)
+				}
 				password = base64.StdEncoding.EncodeToString([]byte(password[:32]))
 			}
 			us[i] = option.ShadowsocksUser{
@@ -114,27 +121,41 @@ func (b *Sing) AddUsers(p *core.AddUsersParams) (added int, err error) {
 			}
 		}
 		err = in.(*anytls.Inbound).AddUsers(us)
+	default:
+		return 0, fmt.Errorf("unsupported sing-box protocol %q", p.NodeInfo.Type)
 	}
 	if err != nil {
 		return 0, err
+	}
+	for i := range p.Users {
+		b.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
+		b.hookServer.AllowUser(p.Tag, p.Users[i].Uuid)
 	}
 	return len(p.Users), err
 }
 
 func (b *Sing) GetUserTraffic(tag, uuid string, reset bool) (up int64, down int64) {
+	b.access.Lock()
+	defer b.access.Unlock()
 	if v, ok := b.hookServer.counter.Load(tag); ok {
 		c := v.(*counter.TrafficCounter)
-		up = c.GetUpCount(uuid)
-		down = c.GetDownCount(uuid)
-		if reset {
-			c.Reset(uuid)
-		}
+		up, down = c.GetCounter(uuid).Snapshot(reset)
 		return
 	}
 	return 0, 0
 }
 
 func (b *Sing) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic, error) {
+	return b.getTraffic(tag, reset, false)
+}
+
+func (b *Sing) DrainTraffic(tag string) ([]panel.UserTraffic, error) {
+	return b.getTraffic(tag, true, true)
+}
+
+func (b *Sing) getTraffic(tag string, reset, force bool) ([]panel.UserTraffic, error) {
+	b.access.Lock()
+	defer b.access.Unlock()
 	trafficSlice := make([]panel.UserTraffic, 0)
 	hook := b.hookServer
 	b.users.mapLock.RLock()
@@ -146,17 +167,15 @@ func (b *Sing) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic,
 			traffic := value.(*counter.TrafficStorage)
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
-			if up+down > b.nodeReportMinTrafficBytes[tag] {
-				if reset {
-					traffic.UpCounter.Store(0)
-					traffic.DownCounter.Store(0)
-				}
-				if b.users.uidMap[uuid] == 0 {
+			if up+down > b.nodeReportMinTrafficBytes[tag] || force {
+				up, down = traffic.Snapshot(reset)
+				if b.users.uidMap[format.UserTag(tag, uuid)] == 0 {
 					c.Delete(uuid)
 					return true
 				}
 				trafficSlice = append(trafficSlice, panel.UserTraffic{
-					UID:      b.users.uidMap[uuid],
+					UID:      b.users.uidMap[format.UserTag(tag, uuid)],
+					Uuid:     uuid,
 					Upload:   up,
 					Download: down,
 				})
@@ -176,6 +195,8 @@ type UserDeleter interface {
 }
 
 func (b *Sing) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
+	b.access.Lock()
+	defer b.access.Unlock()
 	var del UserDeleter
 	if i, found := b.box.Inbound().Get(tag); found {
 		switch info.Type {
@@ -199,20 +220,26 @@ func (b *Sing) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo
 	} else {
 		return errors.New("the inbound not found")
 	}
+	if del == nil {
+		return fmt.Errorf("unsupported sing-box protocol %q", info.Type)
+	}
 	uuids := make([]string, len(users))
 	b.users.mapLock.Lock()
 	defer b.users.mapLock.Unlock()
 	for i := range users {
-		if v, ok := b.hookServer.counter.Load(tag); ok {
-			c := v.(*counter.TrafficCounter)
-			c.Delete(users[i].Uuid)
-		}
-		delete(b.users.uidMap, users[i].Uuid)
 		uuids[i] = users[i].Uuid
+		b.hookServer.RevokeUser(tag, users[i].Uuid)
 	}
 	err := del.DelUsers(uuids)
 	if err != nil {
 		return err
+	}
+	for _, user := range users {
+		if v, ok := b.hookServer.counter.Load(tag); ok {
+			c := v.(*counter.TrafficCounter)
+			c.Delete(user.Uuid)
+		}
+		delete(b.users.uidMap, format.UserTag(tag, user.Uuid))
 	}
 	return nil
 }

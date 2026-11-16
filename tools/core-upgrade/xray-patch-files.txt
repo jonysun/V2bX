@@ -1,0 +1,9 @@
+# V2bX Shadowsocks compatibility and current QUIC MASQUE stream adaptation.
+V2BX.md
+infra/conf/shadowsocks.go
+infra/conf/shadowsocks_compat_test.go
+proxy/shadowsocks/compat_iv_test.go
+proxy/shadowsocks/config.go
+proxy/shadowsocks/protocol.go
+proxy/shadowsocks/validator.go
+transport/internet/masque/connectip/proxy.go

@@ -1,16 +1,18 @@
 package hy2
 
 import (
+	"errors"
 	"github.com/InazumaV/V2bX/conf"
 	vCore "github.com/InazumaV/V2bX/core"
 	"go.uber.org/zap"
+	"sync"
 )
 
 var _ vCore.Core = (*Hysteria2)(nil)
 
 type Hysteria2 struct {
+	mu       sync.RWMutex
 	Hy2nodes map[string]Hysteria2node
-	Auth     *V2bX
 	Logger   *zap.Logger
 }
 
@@ -29,10 +31,7 @@ func New(c *conf.CoreConfig) (vCore.Core, error) {
 	}
 	return &Hysteria2{
 		Hy2nodes: make(map[string]Hysteria2node),
-		Auth: &V2bX{
-			usersMap: make(map[string]int),
-		},
-		Logger: log,
+		Logger:   log,
 	}, nil
 }
 
@@ -47,13 +46,14 @@ func (h *Hysteria2) Start() error {
 }
 
 func (h *Hysteria2) Close() error {
-	for _, n := range h.Hy2nodes {
-		err := n.Hy2server.Close()
-		if err != nil {
-			return err
-		}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var errs []error
+	for tag, n := range h.Hy2nodes {
+		errs = append(errs, n.close())
+		delete(h.Hy2nodes, tag)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (h *Hysteria2) Type() string {

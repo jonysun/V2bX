@@ -72,7 +72,10 @@ func (c *Controller) requestCert() error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("generate private key: %w", err)
+	}
 	tmpl := &x509.Certificate{
 		Version:      3,
 		SerialNumber: big.NewInt(time.Now().Unix()),
@@ -90,7 +93,7 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -99,18 +102,23 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 		Bytes: cert,
 	})
 	if err != nil {
+		_ = f.Close()
 		return err
 	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err := f.Close(); err != nil {
+		return err
+	}
+	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	err = pem.Encode(f, &pem.Block{
-		Type:  "EC PRIVATE KEY",
+		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	})
 	if err != nil {
+		_ = f.Close()
 		return err
 	}
-	return nil
+	return f.Close()
 }

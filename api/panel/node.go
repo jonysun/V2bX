@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -157,29 +158,29 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 		ForceContentType("application/json").
 		Get(path)
 
+	if err = c.checkResponse(r, path, err); err != nil {
+		return nil, err
+	}
 	if r.StatusCode() == 304 {
+		c.pendingNodeETag = ""
+		c.pendingNodeHash = ""
+		c.pendingNode = false
 		return nil, nil
 	}
 	hash := sha256.Sum256(r.Body())
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
+		c.pendingNodeETag = r.Header().Get("ETag")
+		c.pendingNodeHash = newBodyHash
+		c.pendingNode = true
 		return nil, nil
 	}
-	c.responseBodyHash = newBodyHash
-	c.nodeEtag = r.Header().Get("ETag")
-	if err = c.checkResponse(r, path, err); err != nil {
-		return nil, err
-	}
 
-	if r != nil {
-		defer func() {
-			if r.RawBody() != nil {
-				r.RawBody().Close()
-			}
-		}()
-	} else {
-		return nil, fmt.Errorf("received nil response")
-	}
+	defer func() {
+		if r.RawBody() != nil {
+			r.RawBody().Close()
+		}
+	}()
 	node = &NodeInfo{
 		Id:   c.NodeId,
 		Type: c.NodeType,
@@ -262,21 +263,18 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 		cm = &rsp.CommonNode
 		node.Hysteria2 = rsp
 		node.Security = Tls
+	default:
+		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
+	}
+	if cm == nil {
+		return nil, fmt.Errorf("node configuration is missing common fields")
 	}
 
 	// parse rules and dns
 	for i := range cm.Routes {
-		var matchs []string
-		if _, ok := cm.Routes[i].Match.(string); ok {
-			matchs = strings.Split(cm.Routes[i].Match.(string), ",")
-		} else if _, ok = cm.Routes[i].Match.([]string); ok {
-			matchs = cm.Routes[i].Match.([]string)
-		} else {
-			temp := cm.Routes[i].Match.([]interface{})
-			matchs = make([]string, len(temp))
-			for i := range temp {
-				matchs[i] = temp[i].(string)
-			}
+		matchs, matchErr := routeMatches(cm.Routes[i].Match)
+		if matchErr != nil {
+			return nil, fmt.Errorf("decode route %d match: %w", i, matchErr)
 		}
 		switch cm.Routes[i].Action {
 		case "block":
@@ -290,6 +288,9 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 				}
 			}
 		case "dns":
+			if len(matchs) == 0 {
+				return nil, fmt.Errorf("decode route %d dns match: empty match list", i)
+			}
 			var domains []string
 			domains = append(domains, matchs...)
 			if matchs[0] != "main" {
@@ -305,27 +306,89 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 	}
 
 	// set interval
-	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
-	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
+	if cm.BaseConfig != nil {
+		node.PushInterval, err = intervalToTime(cm.BaseConfig.PushInterval)
+		if err != nil {
+			return nil, fmt.Errorf("decode push interval: %w", err)
+		}
+		node.PullInterval, err = intervalToTime(cm.BaseConfig.PullInterval)
+		if err != nil {
+			return nil, fmt.Errorf("decode pull interval: %w", err)
+		}
+	}
 
 	node.Common = cm
 	// clear
 	cm.Routes = nil
 	cm.BaseConfig = nil
+	c.pendingNodeHash = newBodyHash
+	c.pendingNodeETag = r.Header().Get("ETag")
+	c.pendingNode = true
 
 	return node, nil
 }
 
-func intervalToTime(i interface{}) time.Duration {
-	switch reflect.TypeOf(i).Kind() {
-	case reflect.Int:
-		return time.Duration(i.(int)) * time.Second
-	case reflect.String:
-		i, _ := strconv.Atoi(i.(string))
-		return time.Duration(i) * time.Second
-	case reflect.Float64:
-		return time.Duration(i.(float64)) * time.Second
+func routeMatches(value interface{}) ([]string, error) {
+	switch match := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if match == "" {
+			return nil, nil
+		}
+		return strings.Split(match, ","), nil
+	case []string:
+		return append([]string(nil), match...), nil
+	case []interface{}:
+		matches := make([]string, len(match))
+		for i := range match {
+			item, ok := match[i].(string)
+			if !ok {
+				return nil, fmt.Errorf("match %d is %T, want string", i, match[i])
+			}
+			matches[i] = item
+		}
+		return matches, nil
 	default:
-		return time.Duration(reflect.ValueOf(i).Int()) * time.Second
+		return nil, fmt.Errorf("unsupported match type %T", value)
 	}
+}
+
+func intervalToTime(value interface{}) (time.Duration, error) {
+	if value == nil {
+		return 0, nil
+	}
+	var seconds int64
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.String:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(rv.String()), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid interval %q: %w", rv.String(), err)
+		}
+		seconds = parsed
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		seconds = rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		unsigned := rv.Uint()
+		if unsigned > uint64(math.MaxInt64) {
+			return 0, fmt.Errorf("interval %v overflows", value)
+		}
+		seconds = int64(unsigned)
+	case reflect.Float32, reflect.Float64:
+		f := rv.Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) || f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
+			return 0, fmt.Errorf("invalid interval %v", value)
+		}
+		seconds = int64(f)
+	default:
+		return 0, fmt.Errorf("unsupported interval type %T", value)
+	}
+	if seconds < 0 {
+		return 0, fmt.Errorf("interval must not be negative")
+	}
+	if seconds > math.MaxInt64/int64(time.Second) {
+		return 0, fmt.Errorf("interval %v overflows duration", value)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }

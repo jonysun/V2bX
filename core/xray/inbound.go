@@ -6,13 +6,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	stdnet "net"
+	"strconv"
 	"strings"
-	"time"
 
 	"encoding/json"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/conf"
+	vCore "github.com/InazumaV/V2bX/core"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	coreConf "github.com/xtls/xray-core/infra/conf"
@@ -20,6 +22,12 @@ import (
 
 // BuildInbound build Inbound config for different protocol
 func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
+	if err := vCore.ValidateNodeInfo(nodeInfo); err != nil {
+		return nil, err
+	}
+	if option == nil || option.XrayOptions == nil {
+		return nil, errors.New("XrayOptions is required")
+	}
 	in := &coreConf.InboundDetourConfig{}
 	var err error
 	var network string
@@ -58,7 +66,7 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 	// Set SniffingConfig
 	sniffingConfig := &coreConf.SniffingConfig{
 		Enabled:      true,
-		DestOverride: &coreConf.StringList{"http", "tls"},
+		DestOverride: coreConf.StringList{"http", "tls"},
 	}
 	if option.XrayOptions.DisableSniffing {
 		sniffingConfig.Enabled = false
@@ -116,22 +124,18 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 		// Reality
 		in.StreamSetting.Security = "reality"
 		v := nodeInfo.VAllss
-		dest := v.TlsSettings.Dest
-		if dest == "" {
-			dest = v.TlsSettings.ServerName
+		dest, port, mtd, err := vCore.RealityHandshake(v)
+		if err != nil {
+			return nil, err
 		}
 		xver := v.TlsSettings.Xver
 		if xver == 0 {
 			xver = v.RealityConfig.Xver
 		}
-		d, err := json.Marshal(fmt.Sprintf(
-			"%s:%s",
-			dest,
-			v.TlsSettings.ServerPort))
+		d, err := json.Marshal(stdnet.JoinHostPort(dest, strconv.Itoa(int(port))))
 		if err != nil {
 			return nil, fmt.Errorf("marshal reality dest error: %s", err)
 		}
-		mtd, _ := time.ParseDuration(v.RealityConfig.MaxTimeDiff)
 		in.StreamSetting.REALITYSettings = &coreConf.REALITYConfig{
 			Dest:         d,
 			Xver:         xver,
@@ -140,7 +144,7 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 			PrivateKey:   v.TlsSettings.PrivateKey,
 			MinClientVer: v.RealityConfig.MinClientVer,
 			MaxClientVer: v.RealityConfig.MaxClientVer,
-			MaxTimeDiff:  uint64(mtd.Microseconds()),
+			MaxTimeDiff:  uint64(mtd.Milliseconds()),
 			ShortIds:     []string{v.TlsSettings.ShortId},
 			Mldsa65Seed:  v.TlsSettings.Mldsa65Seed,
 		}
@@ -153,6 +157,17 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 
 func buildV2ray(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
 	v := nodeInfo.VAllss
+	network := v.Network
+	if network == "" {
+		network = "tcp"
+	}
+	switch network {
+	case "tcp", "ws", "grpc", "httpupgrade", "splithttp", "xhttp":
+	default:
+		return fmt.Errorf("unsupported Xray transport %q", network)
+	}
+	t := coreConf.TransportProtocol(network)
+	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
 	if nodeInfo.Type == "vless" {
 		//Set vless
 		inbound.Protocol = "vless"
@@ -213,9 +228,7 @@ func buildV2ray(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *coreCon
 		return nil
 	}
 
-	t := coreConf.TransportProtocol(v.Network)
-	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
-	switch v.Network {
+	switch network {
 	case "tcp":
 		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.TCPSettings)
 		if err != nil {
@@ -273,6 +286,14 @@ func buildTrojan(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *coreCo
 	}
 	t := coreConf.TransportProtocol(network)
 	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
+	if len(v.NetworkSettings) == 0 {
+		switch network {
+		case "tcp", "ws", "grpc":
+			return nil
+		default:
+			return fmt.Errorf("unsupported Trojan transport %q", network)
+		}
+	}
 	switch network {
 	case "tcp":
 		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.TCPSettings)

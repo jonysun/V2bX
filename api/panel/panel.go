@@ -26,8 +26,35 @@ type Client struct {
 	nodeEtag         string
 	userEtag         string
 	responseBodyHash string
+	pendingNodeETag  string
+	pendingNodeHash  string
+	pendingNode      bool
+	pendingUserETag  string
+	pendingUser      bool
 	UserList         *UserListBody
 	AliveMap         *AliveMap
+}
+
+// CommitNodeInfo acknowledges the most recently decoded node snapshot. Call it
+// only after the controller has applied that snapshot successfully.
+func (c *Client) CommitNodeInfo() {
+	if c.pendingNode {
+		c.nodeEtag = c.pendingNodeETag
+		c.responseBodyHash = c.pendingNodeHash
+	}
+	c.pendingNodeETag = ""
+	c.pendingNodeHash = ""
+	c.pendingNode = false
+}
+
+// CommitUserList acknowledges the most recently decoded user snapshot. Call
+// it only after all corresponding core mutations have succeeded.
+func (c *Client) CommitUserList() {
+	if c.pendingUser {
+		c.userEtag = c.pendingUserETag
+	}
+	c.pendingUserETag = ""
+	c.pendingUser = false
 }
 
 func New(c *conf.ApiConfig) (*Client, error) {
@@ -36,7 +63,7 @@ func New(c *conf.ApiConfig) (*Client, error) {
 		client = resty.NewWithLocalAddr(&net.TCPAddr{
 			IP: net.ParseIP(c.APISendIP),
 		})
-	} else {	
+	} else {
 		client = resty.New()
 	}
 	client.SetRetryCount(3)

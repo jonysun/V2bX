@@ -38,20 +38,22 @@ func (c *Client) GetUserList() ([]UserInfo, error) {
 		SetHeader("X-Response-Format", "msgpack").
 		SetDoNotParseResponse(true).
 		Get(path)
-	if r == nil || r.RawResponse == nil {
-		return nil, fmt.Errorf("received nil response or raw response")
+	if err = c.checkResponse(r, path, err); err != nil {
+		return nil, err
+	}
+	if r.RawResponse == nil {
+		return nil, fmt.Errorf("request %s failed: received nil raw response", c.assembleURL(path))
 	}
 	defer r.RawResponse.Body.Close()
 
 	if r.StatusCode() == 304 {
+		c.pendingUserETag = ""
+		c.pendingUser = false
 		return nil, nil
 	}
 
-	if err = c.checkResponse(r, path, err); err != nil {
-		return nil, err
-	}
-	userlist := &UserListBody{}
-	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
+	userlist := &UserListBody{Users: make([]UserInfo, 0)}
+	if strings.Contains(strings.ToLower(r.Header().Get("Content-Type")), "application/x-msgpack") {
 		decoder := msgpack.NewDecoder(r.RawResponse.Body)
 		if err := decoder.Decode(userlist); err != nil {
 			return nil, fmt.Errorf("decode user list error: %w", err)
@@ -86,37 +88,41 @@ func (c *Client) GetUserList() ([]UserInfo, error) {
 			userlist.Users = append(userlist.Users, u)
 		}
 	}
-	c.userEtag = r.Header().Get("ETag")
+	if userlist.Users == nil {
+		userlist.Users = make([]UserInfo, 0)
+	}
+	c.pendingUserETag = r.Header().Get("ETag")
+	c.pendingUser = true
 	return userlist.Users, nil
 }
 
 // GetUserAlive will fetch the alive_ip count for users
 func (c *Client) GetUserAlive() (map[int]int, error) {
-	c.AliveMap = &AliveMap{}
 	const path = "/api/v1/server/UniProxy/alivelist"
 	r, err := c.client.R().
 		ForceContentType("application/json").
 		Get(path)
-	if err != nil || r.StatusCode() >= 399 {
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
+	if err = c.checkResponse(r, path, err); err != nil {
+		return nil, err
 	}
-	if r == nil || r.RawResponse == nil {
-		fmt.Printf("received nil response or raw response")
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
+	if r.RawResponse == nil {
+		return nil, fmt.Errorf("request %s failed: received nil raw response", c.assembleURL(path))
 	}
 	defer r.RawResponse.Body.Close()
-	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
-		fmt.Printf("unmarshal user alive list error: %s", err)
-		c.AliveMap.Alive = make(map[int]int)
+	aliveMap := &AliveMap{}
+	if err := json.Unmarshal(r.Body(), aliveMap); err != nil {
+		return nil, fmt.Errorf("decode user alive list error: %w", err)
 	}
-
+	if aliveMap.Alive == nil {
+		aliveMap.Alive = make(map[int]int)
+	}
+	c.AliveMap = aliveMap
 	return c.AliveMap.Alive, nil
 }
 
 type UserTraffic struct {
 	UID      int
+	Uuid     string
 	Upload   int64
 	Download int64
 }
@@ -148,7 +154,7 @@ func (c *Client) ReportNodeOnlineUsers(data *map[int][]string) error {
 	err = c.checkResponse(r, path, err)
 
 	if err != nil {
-		return nil
+		return err
 	}
 
 	return nil

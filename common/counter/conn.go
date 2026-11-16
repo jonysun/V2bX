@@ -3,6 +3,7 @@ package counter
 import (
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing/common/bufio"
 
@@ -17,12 +18,20 @@ type ConnCounter struct {
 	storage   *TrafficStorage
 	readFunc  network.CountFunc
 	writeFunc network.CountFunc
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewConnCounter(conn net.Conn, s *TrafficStorage) net.Conn {
+	return NewConnCounterWithClose(conn, s, nil)
+}
+
+func NewConnCounterWithClose(conn net.Conn, s *TrafficStorage, onClose func()) net.Conn {
 	return &ConnCounter{
 		ExtendedConn: bufio.NewExtendedConn(conn),
 		storage:      s,
+		onClose:      onClose,
 		readFunc: func(n int64) {
 			s.UpCounter.Add(n)
 		},
@@ -32,15 +41,25 @@ func NewConnCounter(conn net.Conn, s *TrafficStorage) net.Conn {
 	}
 }
 
+func (c *ConnCounter) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.ExtendedConn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.closeErr
+}
+
 func (c *ConnCounter) Read(b []byte) (n int, err error) {
 	n, err = c.ExtendedConn.Read(b)
-	c.storage.UpCounter.Store(int64(n))
+	c.storage.UpCounter.Add(int64(n))
 	return
 }
 
 func (c *ConnCounter) Write(b []byte) (n int, err error) {
 	n, err = c.ExtendedConn.Write(b)
-	c.storage.DownCounter.Store(int64(n))
+	c.storage.DownCounter.Add(int64(n))
 	return
 }
 
@@ -88,12 +107,20 @@ type PacketConnCounter struct {
 	storage   *TrafficStorage
 	readFunc  network.CountFunc
 	writeFunc network.CountFunc
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewPacketConnCounter(conn network.PacketConn, s *TrafficStorage) network.PacketConn {
+	return NewPacketConnCounterWithClose(conn, s, nil)
+}
+
+func NewPacketConnCounterWithClose(conn network.PacketConn, s *TrafficStorage, onClose func()) network.PacketConn {
 	return &PacketConnCounter{
 		PacketConn: conn,
 		storage:    s,
+		onClose:    onClose,
 		readFunc: func(n int64) {
 			s.UpCounter.Add(n)
 		},
@@ -101,6 +128,16 @@ func NewPacketConnCounter(conn network.PacketConn, s *TrafficStorage) network.Pa
 			s.DownCounter.Add(n)
 		},
 	}
+}
+
+func (p *PacketConnCounter) Close() error {
+	p.closeOnce.Do(func() {
+		p.closeErr = p.PacketConn.Close()
+		if p.onClose != nil {
+			p.onClose()
+		}
+	})
+	return p.closeErr
 }
 
 func (p *PacketConnCounter) ReadPacket(buff *buf.Buffer) (destination M.Socksaddr, err error) {
