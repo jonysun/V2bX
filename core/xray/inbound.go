@@ -331,7 +331,14 @@ func buildShadowsocks(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *c
 	cipher := s.Cipher
 	if s.ServerKey != "" {
 		settings.Password = s.ServerKey
-		randomPasswd = base64.StdEncoding.EncodeToString([]byte(randomPasswd))
+		placeholderKey := []byte(randomPasswd)
+		switch s.Cipher {
+		case "2022-blake3-aes-128-gcm":
+			placeholderKey = p[:16]
+		case "2022-blake3-aes-256-gcm":
+			placeholderKey = p
+		}
+		randomPasswd = base64.StdEncoding.EncodeToString(placeholderKey)
 		cipher = ""
 	}
 	defaultSSuser := &coreConf.ShadowsocksUserConfig{
