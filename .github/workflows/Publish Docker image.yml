@@ -50,6 +50,7 @@ jobs:
         with:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
           push: false
 
   build:
@@ -78,7 +79,7 @@ jobs:
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+          if [[ -n "$IMAGE_TAG" && ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo "Invalid Docker image tag: $IMAGE_TAG" >&2
             exit 1
           fi
@@ -92,7 +93,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=ref,event=pr
-            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
+            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }},priority=1000
           
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -113,7 +114,18 @@ jobs:
         with:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Verify image version
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          output=$(docker run --rm --platform "$IMAGE_PLATFORM" --entrypoint V2bX "${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}" version)
+          echo "$output"
+          grep -F "V2bX ${IMAGE_VERSION} (" <<<"$output"
 
       - name: Export digest
         run: |
@@ -157,7 +169,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=ref,event=pr
-            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
+            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }},priority=1000
           
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
